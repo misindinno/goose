@@ -1,0 +1,114 @@
+name: Goose iPhone build checks
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: goose-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-smoke-tests:
+    name: Rust core smoke tests
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.94
+        run: |
+          rustup toolchain install 1.94.0 --profile minimal
+          rustup override set 1.94.0
+      # The upstream full suite references an uncommitted external protocol map
+      # in command_tests.rs. These checks do not claim full-suite coverage.
+      - name: Test library, protocol, Swift bridge, and storage
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p build/logs
+          cargo test --locked --manifest-path Rust/core/Cargo.toml \
+            --lib --test protocol_tests --test bridge_tests --test store_tests \
+            2>&1 | tee build/logs/rust-tests.log
+      - name: Save test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-smoke-test-log
+          path: build/logs/
+          if-no-files-found: warn
+          retention-days: 7
+
+  iphone-build:
+    name: Compile unsigned iPhone app
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check Xcode and iOS SDK
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+      - name: Install Rust and iPhone target
+        run: |
+          rustup toolchain install 1.94.0 --profile minimal --target aarch64-apple-ios
+          rustup override set 1.94.0
+          cargo fetch --locked --manifest-path Rust/core/Cargo.toml
+      - name: Compile Swift app, widget, and Rust core
+        shell: bash
+        env:
+          CARGO_NET_OFFLINE: 'true'
+        run: |
+          set -o pipefail
+          mkdir -p build/logs
+          xcodebuild \
+            -project GooseSwift.xcodeproj \
+            -target GooseSwift \
+            -configuration Debug \
+            -sdk iphoneos \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            SYMROOT="$PWD/build/products" OBJROOT="$PWD/build/intermediates" \
+            build 2>&1 | tee build/logs/iphone-build.log
+      - name: Package unsigned app for later signing
+        run: |
+          mkdir -p build/package/Payload
+          ditto build/products/Debug-iphoneos/GooseSwift.app build/package/Payload/GooseSwift.app
+          cd build/package
+          zip -qry ../Goose-unsigned.ipa Payload
+      - name: Save unsigned app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Goose-unsigned-requires-signing
+          path: build/Goose-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
+      - name: Save build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iphone-build-log
+          path: build/logs/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Explain artifact limitations
+        if: success()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'SUMMARY'
+          ## iPhone compilation succeeded
+          The IPA is unsigned and cannot be installed directly on an iPhone.
+          Device signing/provisioning is still required, including compatibility
+          with the app's HealthKit entitlement and Live Activity extension.
+          This checks compilation, not launch, Bluetooth, or WHOOP MG sync.
+          Rust smoke-test results are reported by the separate job.
+          SUMMARY
